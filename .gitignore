@@ -1,0 +1,27 @@
+# python cache
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+.pytest_cache/
+
+# env
+.venv/
+env/
+ENV/
+*.env
+
+# outputs
+results/
+test_results/
+
+# large / generated schedules
+schedules/*.pkl
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/

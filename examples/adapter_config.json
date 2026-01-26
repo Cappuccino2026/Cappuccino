@@ -1,0 +1,40 @@
+{
+    "adapters": [
+        {
+            "dataset_idx": 0,
+            "global_batch_size": 8,
+            "rank": 16,
+            "microbatch_size": 2,
+            "target_modules": "q_proj+k_proj+v_proj+o_proj",
+            "dropout": 0.05,
+            "alpha": 32
+        },
+        {
+            "dataset_idx": 1,
+            "global_batch_size": 8,
+            "rank": 16,
+            "microbatch_size": 2,
+            "target_modules": "q_proj+k_proj+v_proj+o_proj",
+            "dropout": 0.05,
+            "alpha": 32
+        },
+        {
+            "dataset_idx": 2,
+            "global_batch_size": 8,
+            "rank": 16,
+            "microbatch_size": 2,
+            "target_modules": "q_proj+k_proj+v_proj+o_proj",
+            "dropout": 0.05,
+            "alpha": 32
+        },
+        {
+            "dataset_idx": 3,
+            "global_batch_size": 8,
+            "rank": 16,
+            "microbatch_size": 2,
+            "target_modules": "q_proj+k_proj+v_proj+o_proj",
+            "dropout": 0.05,
+            "alpha": 32
+        }
+    ]
+}
