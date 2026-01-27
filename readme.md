@@ -6,7 +6,7 @@ Cappuccino is a replica-level orchestration framework for heterogeneous multi-Lo
 
 Cappuccino integrates three main modules: Cappuccino Profiler, GPU Allocator, and Pipeline Scheduler. Cappuccino performs inter-replica and intra-replica optimizations based on a performance model for heterogeneous multi-LoRA workloads. It first profiles the target backbone model to obtain latency and GPU memory statistics under different configurations, and uses these measurements to construct a performance model for multi-LoRA fine-tuning. Guided by this model, a workload-aware GPU allocator clusters LoRA adapters according to their resource demands and allocates a cost-efficient number of GPUs to each replica, minimizing the total GPU time spent across all replicas. On top of this replica configuration, a hetero-LoRA pipeline scheduler then generates per-replica pipeline execution plans that pack and reorder micro-batches to reduce pipeline bubbles and padding overhead, further shortening the iteration time for heterogeneous multi-LoRA workloads.
 
-![Cappuccino Overview](images/overview.png)
+![Cappuccino Overview](images/overview.pdf)
 
 ## Getting Started
 
