@@ -1,138 +1,139 @@
-from typing import Dict, List, Tuple, Optional, Any
-from dataclasses import dataclass
-from dataclasses import asdict
-import time
-import os
-import sys
+from __future__ import annotations
+
 import json
 import pickle
 import time
-import contextlib
-import io
+from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple, Union
+
 import click
 from loguru import logger
-import time
+
+from .profiler.mem_cost_model import MemCostModel
+from .profiler.time_cost_model import TimeCostModel
 from .utils import (
-    load_dataset_list,
-    json_utils_default,
-    list_of_floats,
-    list_of_ints,
-    set_seed,
-    update_loguru_level,
+    AdapterGroupStepInfo,
+    MicroBatchInfo,
     MockDataArguments,
     MockDataset,
+    json_utils_default,
+    list_of_ints,
+    load_dataset_list,
     stringify_keys,
-    AdapterGroupStepInfo,
-    MicroBatchInfo
 )
-from .profiler.time_cost_model import TimeCostModel
-from .profiler.mem_cost_model import MemCostModel
 
-# GPU 显存大小映射
-# 按百分之80 使用率计算可用显存
-GPU_MEMORY_LIMIT_MAP = {
-    'a100-40gb': 40.0,
-    'a100-80gb': 80.0,
+SampleRef = Tuple[int, int, int]
+MicroBatch = Tuple[List[SampleRef], List[int]]
+Schedule = List[MicroBatch]
+
+GPU_MEMORY_LIMIT_MAP: Dict[str, float] = {
+    "a100-40gb": 40.0,
+    "a100-80gb": 80.0,
 }
 
-GPU_TYPE = 'a100-40gb'
-
-MEM_PROFILE_DATA_PATH = 'profile_pp_combined.csv'
-TIME_PROFILE_DATA_PATH = 'profile_pp_combined.csv'
+GPU_TYPE = "a100-40gb"
+DEFAULT_GPU_MEMORY_LIMIT = GPU_MEMORY_LIMIT_MAP.get(GPU_TYPE, 40.0)
+MEM_PROFILE_DATA_PATH = "profile_pp_combined.csv"
+TIME_PROFILE_DATA_PATH = "profile_pp_combined.csv"
+DEFAULT_ADAPTER_RANK = 16
+LEGACY_MEMORY_CHECK_ADAPTER_RANK = 8
 
 
 @dataclass
 class SimpleMicroBatchInfo:
-    """微批次信息"""
-    original_index: int  # 这个微批次在原 batch 的位置
+    """Metadata for a micro-batch candidate used by the planner."""
+
+    original_index: int
     max_length: int
     total_tokens: int
     microbatch_size: int
     adapter_count: int
-    samples: List[Tuple[int, int, int]]  # [(adapter_idx, batch_idx, sample_idx), ...]
+    samples: List[SampleRef]
     optimizer_steps: List[int]
 
-def save_schedule(schedule: list[AdapterGroupStepInfo], path:str, output_name: str):
-    schedule_pickle_path = f"{path}/{output_name}_schedule.pkl"
-    schedule_json_path = f"{path}/{output_name}_schedule.json"
-    with open(schedule_pickle_path, "wb") as f:
+
+def save_schedule(schedule: List[AdapterGroupStepInfo], path: str, output_name: str) -> None:
+    """Save a schedule in both pickle and JSON formats."""
+    output_dir = Path(path)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    schedule_pickle_path = output_dir / f"{output_name}_schedule.pkl"
+    schedule_json_path = output_dir / f"{output_name}_schedule.json"
+
+    with schedule_pickle_path.open("wb") as f:
         pickle.dump(schedule, f)
-    logger.info(f"Saved schedule pickle to {schedule_pickle_path}")
-    with open(schedule_json_path, "w") as f:
+    logger.info("Schedule pickle saved: {}", schedule_pickle_path)
+
+    with schedule_json_path.open("w", encoding="utf-8") as f:
         json.dump(
-            [stringify_keys(asdict(s)) for s in schedule], f, default=json_utils_default, indent=2
+            [stringify_keys(asdict(item)) for item in schedule],
+            f,
+            default=json_utils_default,
+            indent=2,
         )
-    logger.info(f"Saved schedule json to {schedule_json_path}")
+    logger.info("Schedule JSON saved: {}", schedule_json_path)
 
 
 class PipelineExecutionConstruction:
+    """Construct Cappuccino-optimized pipeline execution schedules."""
 
-    def __init__(self, model_name: str = "meta-llama/Llama-3.1-8B-Instruct"):
+    def __init__(self, model_name: str = "meta-llama/Llama-3.1-8B-Instruct") -> None:
         self.model_name = model_name
 
-        # 模型实例缓存（如果后面需要按 pp_size 细分）
-        self.mem_models: Dict[int, any] = {}
+        # Reserved for future pp_size-specific memory models.
+        self.mem_models: Dict[int, Any] = {}
 
-        # 单卡 profile 得到的建模结果
-        self.mem_model: Optional[any] = None
-        self.time_model: Optional[any] = None
-
-        # 初始化时间模型
-        self._initialize_time_model()
-        # 初始化内存模型
-        self._initailize_mem_model()
-
-        # time.sleep(10)
+        # Single-GPU profile-based cost models.
+        self.mem_model: Optional[Any] = None
+        self.time_model: Optional[Any] = None
+        self.precomputed_times: List[List[float]] = []
         self.is_padding = False
 
+        self._initialize_time_model()
+        self._initialize_mem_model()
 
-        print(f"PipelineExecutionConstruction initialized for model: {model_name}")
+        logger.info(
+            "PipelineExecutionConstruction initialized | model={}",
+            self.model_name,
+        )
 
-    def _initialize_time_model(self):
-        """
-        初始化时间成本模型
-        这里的时间成本模型是在单卡上进行估计的
-        """
-
+    def _initialize_time_model(self) -> None:
+        """Initialize the single-GPU execution-time cost model."""
         try:
             self.time_model = TimeCostModel(
                 model_name=self.model_name,
-                csv_name=TIME_PROFILE_DATA_PATH
+                csv_name=TIME_PROFILE_DATA_PATH,
             )
-            print(f"Initialized TimeCostModel for {self.model_name} ")
-        except Exception as e:
-            print(f"[WARN] Failed to initialize TimeCostModel: {e}")
+            logger.info("TimeCostModel initialized | model={}", self.model_name)
+        except Exception as exc:  # pragma: no cover - depends on local profile files.
+            logger.warning("Failed to initialize TimeCostModel | error={}", exc)
 
-    def _initailize_mem_model(self):
-        """
-        初始化内存成本模型
-        这里的内存成本模型是在单卡上进行估计的
-        """
-
+    def _initialize_mem_model(self) -> None:
+        """Initialize the single-GPU memory cost model."""
         try:
             self.mem_model = MemCostModel(
                 model_name=self.model_name,
-                csv_name=MEM_PROFILE_DATA_PATH
+                csv_name=MEM_PROFILE_DATA_PATH,
             )
-            print(f"Initialized MemCostModel for {self.model_name} ")
-        except Exception as e:
-            print(f"[WARN] Failed to initialize MemCostModel: {e}")
-            
-    # step-level 检查一个 batch 中的微批次调度是否符合显存限制, 传入具体的微批次调度
+            logger.info("MemCostModel initialized | model={}", self.model_name)
+        except Exception as exc:  # pragma: no cover - depends on local profile files.
+            logger.warning("Failed to initialize MemCostModel | error={}", exc)
+
     def step_level_check_if_fit_memory(
         self,
-        batch_microbatches: List[Tuple[List[Tuple[int, int, int]], List[int]]],
+        batch_microbatches: Schedule,
         aggregated_dataset: List[List[List[int]]],
         pp_size: int = 4,
-        gpu_memory_limit: float = GPU_MEMORY_LIMIT_MAP.get(GPU_TYPE, 40.0),
+        gpu_memory_limit: float = DEFAULT_GPU_MEMORY_LIMIT,
     ) -> bool:
-        """检查给定的微批次调度是否符合显存限制"""
+        """Return whether all micro-batches in a batch fit the memory budget."""
         if not batch_microbatches:
             return True
+        if self.mem_model is None:
+            raise RuntimeError("MemCostModel is not initialized.")
 
-        for mb_idx, (microbatch_samples, optimizer_steps) in enumerate(batch_microbatches):
-            # 一个微批次中样本的数量
+        for microbatch_samples, _ in batch_microbatches:
             combined_mbs = len(microbatch_samples)
             combined_max_length = 0
             adapter_set = set()
@@ -143,9 +144,7 @@ class PipelineExecutionConstruction:
                 adapter_set.add(adapter_idx)
 
             combined_adapter_count = len(adapter_set)
-            combined_rank = combined_adapter_count * 8  # 假设每个适配器 rank=8
-
-            # 检查每个流水线阶段的显存使用，假设全都是均匀分配的
+            combined_rank = combined_adapter_count * LEGACY_MEMORY_CHECK_ADAPTER_RANK
             mem_usage = self.mem_model.stage_memory_estimate(
                 bsz=combined_mbs,
                 seqlen=combined_max_length,
@@ -154,22 +153,22 @@ class PipelineExecutionConstruction:
                 pp_size=pp_size,
             )
             if mem_usage > gpu_memory_limit:
-                print(f"微批次 {mb_idx} 显存使用 {mem_usage:.2f}GB 超过限制 {gpu_memory_limit}GB")
                 return False
 
         return True
 
-    def job_leval_check_if_fit_memory(
+    def job_level_check_if_fit_memory(
         self,
         micro_batchsize: int,
         seq_length: int,
         rank: int,
         pp_size: int,
-        gpu_memory_limit: float = GPU_MEMORY_LIMIT_MAP.get(GPU_TYPE, 40.0),
+        gpu_memory_limit: float = DEFAULT_GPU_MEMORY_LIMIT,
     ) -> bool:
-        """检查给定的微批次参数是否符合显存限制"""
+        """Return whether a single job configuration fits the memory budget."""
+        if self.mem_model is None:
+            raise RuntimeError("MemCostModel is not initialized.")
 
-        # 假设每个阶段均匀分配显存
         mem_usage = self.mem_model.stage_memory_estimate(
             bsz=micro_batchsize,
             seqlen=seq_length,
@@ -177,291 +176,245 @@ class PipelineExecutionConstruction:
             pp_size=pp_size,
             tasknum=1,
         )
-        if mem_usage > gpu_memory_limit:
-            print(f"显存使用 {mem_usage:.2f}GB 超过限制 {gpu_memory_limit}GB——micro_batchsize为{micro_batchsize},seqlen为{seq_length},ppsize为{pp_size}")
-            return False
-        return True
+        return mem_usage <= gpu_memory_limit
+
+    def job_leval_check_if_fit_memory(self, *args: Any, **kwargs: Any) -> bool:
+        """Backward-compatible alias for the previous misspelled method name."""
+        return self.job_level_check_if_fit_memory(*args, **kwargs)
 
     def _build_sorted_microbatch_infos(
         self,
-        batch_microbatches: List[Tuple[List[Tuple[int, int, int]], List[int]]],
+        batch_microbatches: Schedule,
         aggregated_dataset: List[List[List[int]]],
     ) -> List[SimpleMicroBatchInfo]:
+        """Build micro-batch metadata and sort it by maximum sequence length."""
         microbatch_infos: List[SimpleMicroBatchInfo] = []
-        for mb_idx, (microbatch_samples, optimizer_steps) in enumerate(batch_microbatches):
+        for microbatch_idx, (microbatch_samples, optimizer_steps) in enumerate(batch_microbatches):
             max_length = 0
             adapter_set = set()
             for adapter_idx, batch_idx, sample_idx in microbatch_samples:
                 sample_length = aggregated_dataset[adapter_idx][batch_idx][sample_idx]
                 max_length = max(max_length, sample_length)
                 adapter_set.add(adapter_idx)
-            total_tokens = max_length * len(microbatch_samples)
+
             microbatch_infos.append(
                 SimpleMicroBatchInfo(
-                    original_index=mb_idx,
+                    original_index=microbatch_idx,
                     max_length=max_length,
-                    total_tokens=total_tokens,
+                    total_tokens=max_length * len(microbatch_samples),
                     microbatch_size=len(microbatch_samples),
                     adapter_count=len(adapter_set),
                     samples=microbatch_samples,
                     optimizer_steps=optimizer_steps,
                 )
             )
-        return sorted(microbatch_infos, key=lambda x: x.max_length)
-    
-    def _partition_objective(
-        self,
-        seg_costs: List[float],
-        pp_size: int,
-    ) -> float:
-        """
-        Keep identical objective to your Cappuccino code:
-          current_iteration_time = (pp-1)*t_max + sum(seg_costs)
-          overall = current_iteration_time * (m+p-1)/m
-        """
-        m = len(seg_costs)
-        if m <= 0:
+
+        return sorted(microbatch_infos, key=lambda item: item.max_length)
+
+    def _partition_objective(self, segment_costs: List[float], pp_size: int) -> float:
+        """Compute the Cappuccino partition objective for a packed schedule."""
+        num_segments = len(segment_costs)
+        if num_segments <= 0:
             return float("inf")
-        t_max = max(seg_costs)
-        current_iteration_time = (pp_size - 1) * t_max + sum(seg_costs)
-        overall = current_iteration_time * (m + pp_size - 1) / m
-        return overall
-    
+
+        max_segment_cost = max(segment_costs)
+        iteration_time = (pp_size - 1) * max_segment_cost + sum(segment_costs)
+        return iteration_time * (num_segments + pp_size - 1) / num_segments
+
     def _cappuccino_pipeline_planner(
         self,
-        batch_microbatches: List[Tuple[List[Tuple[int, int, int]], List[int]]],
+        batch_microbatches: Schedule,
         aggregated_dataset: List[List[List[int]]],
         pp_size: int = 4,
-        gpu_memory_limit: float = GPU_MEMORY_LIMIT_MAP.get(GPU_TYPE, 40.0),
+        gpu_memory_limit: float = DEFAULT_GPU_MEMORY_LIMIT,
         is_return_cappuccino_without_reorder: bool = True,
-    ):
-        """
-        使用 Cappuccino 算法优化单个 batch 的微批次调度
-
-        Args:
-            batch_microbatches: 单个 batch 的微批次列表
-            aggregated_dataset: 聚合数据集 [适配器][批次][样本]
-            pp_size: 流水线阶段数
-            gpu_memory_limit: GPU 显存限制 (GB)
-
-        Returns:
-            优化后的微批次调度, 以及估计的 iteration time
-        """
-
+    ) -> Union[Tuple[Schedule, Schedule, Optional[float]], Tuple[Schedule, Optional[float]]]:
+        """Optimize the micro-batch schedule for one logical batch."""
         if not batch_microbatches:
+            if is_return_cappuccino_without_reorder:
+                return [], [], None
             return [], None
 
-        print(f"开始优化 batch, 包含 {len(batch_microbatches)} 个微批次")
-
         start_time = time.time()
-
-        # 1. 提取微批次信息并按样本长度排序
-        microbatch_infos: List[SimpleMicroBatchInfo] = []
-        for mb_idx, (microbatch_samples, optimizer_steps) in enumerate(batch_microbatches):
-            max_length = 0
-            adapter_set = set()
-
-            for adapter_idx, batch_idx, sample_idx in microbatch_samples:
-                sample_length = aggregated_dataset[adapter_idx][batch_idx][sample_idx]
-                max_length = max(max_length, sample_length)
-                adapter_set.add(adapter_idx)
-
-            total_tokens = max_length * len(microbatch_samples)
-
-            microbatch_info = SimpleMicroBatchInfo(
-                original_index=mb_idx,
-                max_length=max_length,
-                total_tokens=total_tokens,
-                microbatch_size=len(microbatch_samples),
-                adapter_count=len(adapter_set),
-                samples=microbatch_samples,
-                optimizer_steps=optimizer_steps,
-            )
-            microbatch_infos.append(microbatch_info)
-
-        # 按最大样本长度升序排序
-        sorted_microbatch_infos = sorted(
-            microbatch_infos,
-            key=lambda x: x.max_length,
+        sorted_microbatch_infos = self._build_sorted_microbatch_infos(
+            batch_microbatches=batch_microbatches,
+            aggregated_dataset=aggregated_dataset,
         )
-
-        # 2. 构建预计算时间矩阵
         num_microbatches = len(sorted_microbatch_infos)
-        precomputed_times = self._get_precomputed_times(
-            sorted_microbatch_infos, aggregated_dataset, pp_size, gpu_memory_limit
-        )
 
-        # 3. 获取 t_max 候选值
+        precomputed_times = self._get_precomputed_times(
+            sorted_microbatch_infos=sorted_microbatch_infos,
+            aggregated_dataset=aggregated_dataset,
+            pp_size=pp_size,
+            gpu_memory_limit=gpu_memory_limit,
+        )
         t_max_candidates = self._get_t_max_candidates(precomputed_times)
 
         if not t_max_candidates:
-            print("警告：没有找到有效的时间候选值，使用原始调度")
+            logger.warning(
+                "No feasible t_max candidate found; returning the original batch schedule."
+            )
             if is_return_cappuccino_without_reorder:
                 return batch_microbatches, batch_microbatches, None
             return batch_microbatches, None
 
-        # 4. 动态规划求解最优分组
-        min_iteration_time = float('inf')
-        best_partition = None
+        min_iteration_time = float("inf")
+        best_partition: Optional[List[Tuple[int, int]]] = None
         best_t_max = 0.0
 
         for t_max in t_max_candidates:
-            N = num_microbatches
-            INF = float('inf')
-            # dp2[k][i]: 覆盖前 i 个微批次、恰好分成 k 组的最小组内时间总和
-            dp2 = [[INF] * (N + 1) for _ in range(N + 1)]
-            prev = [[-1] * (N + 1) for _ in range(N + 1)]  # 回溯起点
-            dp2[0][0] = 0.0
+            inf = float("inf")
+            dp = [[inf] * (num_microbatches + 1) for _ in range(num_microbatches + 1)]
+            prev = [[-1] * (num_microbatches + 1) for _ in range(num_microbatches + 1)]
+            dp[0][0] = 0.0
 
-            for k in range(1, N + 1):
-                for i in range(1, N + 1):
-                    best_val = INF
-                    best_j = -1
-                    j_start = k - 1
-                    if j_start > i - 1:
+            for group_count in range(1, num_microbatches + 1):
+                for end_idx in range(1, num_microbatches + 1):
+                    start_min = group_count - 1
+                    if start_min > end_idx - 1:
                         continue
-                    for j in range(j_start, i):
-                        seg_cost = precomputed_times[j][i - 1]  # 组 [j, i) 的代价
-                        if seg_cost > t_max:
-                            continue
-                        prev_cost = dp2[k - 1][j]
-                        if prev_cost == INF:
-                            continue
-                        cand = prev_cost + seg_cost
-                        if cand < best_val:
-                            best_val = cand
-                            best_j = j
-                    dp2[k][i] = best_val
-                    prev[k][i] = best_j
 
-            for k in range(1, N + 1):
-                if dp2[k][N] == INF:
+                    best_val = inf
+                    best_start = -1
+                    for start_idx in range(start_min, end_idx):
+                        segment_cost = precomputed_times[start_idx][end_idx - 1]
+                        if segment_cost > t_max:
+                            continue
+
+                        previous_cost = dp[group_count - 1][start_idx]
+                        if previous_cost == inf:
+                            continue
+
+                        candidate_cost = previous_cost + segment_cost
+                        if candidate_cost < best_val:
+                            best_val = candidate_cost
+                            best_start = start_idx
+
+                    dp[group_count][end_idx] = best_val
+                    prev[group_count][end_idx] = best_start
+
+            for group_count in range(1, num_microbatches + 1):
+                if dp[group_count][num_microbatches] == float("inf"):
                     continue
 
-                current_iteration_time = (pp_size - 1) * t_max + dp2[k][N]
-                m = k  # 组数
-                p = pp_size
+                iteration_time = (pp_size - 1) * t_max + dp[group_count][num_microbatches]
+                overall_iteration_time = iteration_time * (group_count + pp_size - 1) / group_count
 
-                # 这里使用一个简单的折算因子 (m + p - 1) / m，保证 m 越大折算后越接近 current_iteration_time
-                current_overall_iteration_time = current_iteration_time * (m + p - 1) / m
+                if overall_iteration_time >= min_iteration_time:
+                    continue
 
-                if current_overall_iteration_time < min_iteration_time:
-                    # 回溯该 k 的最优分段
-                    partition = []
-                    kk = k
-                    i = N
-                    feasible = True
-                    while kk > 0 and i >= 0:
-                        j = prev[kk][i]
-                        if j < 0:
-                            feasible = False
-                            break
-                        partition.append((j, i))
-                        i = j
-                        kk -= 1
-                    if not feasible or i != 0 or len(partition) != k:
-                        continue
-                    partition.reverse()
+                partition: List[Tuple[int, int]] = []
+                remaining_groups = group_count
+                end_idx = num_microbatches
+                feasible = True
 
-                    min_iteration_time = current_overall_iteration_time
-                    best_partition = partition
-                    best_t_max = t_max
+                while remaining_groups > 0 and end_idx >= 0:
+                    start_idx = prev[remaining_groups][end_idx]
+                    if start_idx < 0:
+                        feasible = False
+                        break
+                    partition.append((start_idx, end_idx))
+                    end_idx = start_idx
+                    remaining_groups -= 1
+
+                if not feasible or end_idx != 0 or len(partition) != group_count:
+                    continue
+
+                partition.reverse()
+                min_iteration_time = overall_iteration_time
+                best_partition = partition
+                best_t_max = t_max
 
         if best_partition is None:
-            print("警告：动态规划未找到有效分组，使用原始调度")
+            logger.warning(
+                "No feasible partition found; returning the original batch schedule."
+            )
             if is_return_cappuccino_without_reorder:
                 return batch_microbatches, batch_microbatches, None
             return batch_microbatches, None
 
-        computation_time = time.time() - start_time
-
-        # print(f"最优分组找到: t_max={best_t_max:.4f}, 迭代时间估计={min_iteration_time:.4f}")
-        # print(f"分组方案: {best_partition}")
-        # print(f"DP计算时间: {computation_time:.4f}秒")
-
-        # 5. 重构优化后的微批次调度
-        optimized_schedule_without_reoder: List[Tuple[List[Tuple[int, int, int]], List[int]]] = []
+        optimized_schedule_without_reorder: Schedule = []
         packed_microbatch_times: List[float] = []
 
-        for group_idx, (group_start, group_end) in enumerate(best_partition):
-            combined_samples: List[Tuple[int, int, int]] = []
+        for group_start, group_end in best_partition:
+            combined_samples: List[SampleRef] = []
             combined_optimizer_steps: List[int] = []
 
-            for mb_idx in range(group_start, group_end):
-                mb = sorted_microbatch_infos[mb_idx]
-                combined_samples.extend(mb.samples)
-                combined_optimizer_steps.extend(mb.optimizer_steps)
+            for microbatch_idx in range(group_start, group_end):
+                microbatch_info = sorted_microbatch_infos[microbatch_idx]
+                combined_samples.extend(microbatch_info.samples)
+                combined_optimizer_steps.extend(microbatch_info.optimizer_steps)
 
-            combined_optimizer_steps = list(set(combined_optimizer_steps))
-
-            optimized_schedule_without_reoder.append((combined_samples, combined_optimizer_steps))
+            optimized_schedule_without_reorder.append(
+                (combined_samples, sorted(set(combined_optimizer_steps)))
+            )
             packed_microbatch_times.append(precomputed_times[group_start][group_end - 1])
 
-        # print("============================优化后的微批次调度情况============================")
-        # for idx, (samples, optimizer_steps) in enumerate(optimized_schedule):
-        #     lengths = [
-        #         aggregated_dataset[adapter_idx][batch_idx][sample_idx]
-        #         for adapter_idx, batch_idx, sample_idx in samples
-        #     ]
-        #     print(
-        #         f"微批次 {idx}: 微批次大小={len(samples)}, 优化器步骤={optimizer_steps}, "
-        #         f"预计算时间={packed_microbatch_times[idx]:.6f}, "
-        #         f"批次样本长度=[{', '.join(str(l) for l in lengths)}], "
-        #         f"批次最长样本长度={max(lengths) if lengths else 0}"
-        #     )
-
-        # print(f"优化完成: {len(batch_microbatches)} 个微批次 -> {len(optimized_schedule)} 个组合微批次")
-
-        print("开始对优化后的调度进行重排序...")
         optimized_schedule_with_reorder = self._reorder_optimized_schedule(
-            optimized_schedule_without_reoder,
-            packed_microbatch_times,
+            optimized_schedule=optimized_schedule_without_reorder,
+            packed_microbatch_times=packed_microbatch_times,
             pp_size=pp_size,
         )
 
+        logger.debug(
+            "Batch planning completed | groups={} | best_t_max={:.6f} | "
+            "estimated_iteration_time={:.6f} | planner_overhead_sec={:.4f}",
+            len(best_partition),
+            best_t_max,
+            min_iteration_time,
+            time.time() - start_time,
+        )
+
         if is_return_cappuccino_without_reorder:
-            return optimized_schedule_without_reoder, optimized_schedule_with_reorder,min_iteration_time
-        
+            return optimized_schedule_without_reorder, optimized_schedule_with_reorder, min_iteration_time
         return optimized_schedule_with_reorder, min_iteration_time
 
     def _reorder_optimized_schedule(
         self,
-        optimized_schedule: List[Tuple[List[Tuple[int, int, int]], List[int]]],
+        optimized_schedule: Schedule,
         packed_microbatch_times: List[float],
-        pp_size: int = 4,  # 保留但本策略不使用
-    ) -> List[Tuple[List[Tuple[int, int, int]], List[int]]]:
+        pp_size: int = 4,
+    ) -> Schedule:
+        """Apply a V-shaped order to packed micro-batches within one batch.
+
+        The smallest micro-batch is placed first, then subsequent micro-batches are
+        alternately placed on the left and right sides. The contents and optimizer
+        steps of each packed micro-batch are unchanged.
         """
-        对“单个 batch 内”的微批次进行 V 型排序（两边小、中间大），且最小的放在最前面。
-        仅改变微批次顺序；不改动每个微批的内容与 optimizer_steps。
-        """
+        del pp_size  # The current reordering strategy is independent of pp_size.
+
         if not optimized_schedule or not packed_microbatch_times:
             return optimized_schedule
 
-        m = len(optimized_schedule)
-        if len(packed_microbatch_times) != m:
-            print(
-                f"警告：packed_microbatch_times 长度 ({len(packed_microbatch_times)}) "
-                f"与 optimized_schedule 长度 ({m}) 不匹配，跳过重排。"
+        num_items = len(optimized_schedule)
+        if len(packed_microbatch_times) != num_items:
+            logger.warning(
+                "Skip schedule reordering because length mismatch | schedule_len={} | time_len={}",
+                num_items,
+                len(packed_microbatch_times),
             )
             return optimized_schedule
 
-        items = [(idx, t, optimized_schedule[idx]) for idx, t in enumerate(packed_microbatch_times)]
-        items.sort(key=lambda x: (x[1], x[0]))  # 小 -> 大；保证相同时间时保序
+        items = [
+            (idx, packed_time, optimized_schedule[idx])
+            for idx, packed_time in enumerate(packed_microbatch_times)
+        ]
+        items.sort(key=lambda item: (item[1], item[0]))
 
-        left, right = 0, m - 1
-        placed: List[Optional[Tuple[float, Tuple[List[Tuple[int, int, int]], List[int]]]]] = [None] * m
+        left, right = 0, num_items - 1
+        placed: List[Optional[Tuple[float, MicroBatch]]] = [None] * num_items
         place_left = True
-        for _, t, mb in items:  # 从小到大
+
+        for _, packed_time, microbatch in items:
             if place_left:
-                placed[left] = (t, mb)
+                placed[left] = (packed_time, microbatch)
                 left += 1
             else:
-                placed[right] = (t, mb)
+                placed[right] = (packed_time, microbatch)
                 right -= 1
             place_left = not place_left
 
-        reordered_schedule = [mb for (t, mb) in placed if mb is not None]
-        return reordered_schedule
+        return [microbatch for item in placed if item is not None for _, microbatch in [item]]
 
     def _get_precomputed_times(
         self,
@@ -470,40 +423,48 @@ class PipelineExecutionConstruction:
         pp_size: int,
         gpu_memory_limit: float,
     ) -> List[List[float]]:
-        """计算预计算时间矩阵"""
-        num_microbatches = len(sorted_microbatch_infos)
-        precomputed_times = [[float('inf')] * num_microbatches for _ in range(num_microbatches)]
+        """Precompute execution-time estimates for all contiguous packed groups."""
+        if self.mem_model is None:
+            raise RuntimeError("MemCostModel is not initialized.")
+        if self.time_model is None:
+            raise RuntimeError("TimeCostModel is not initialized.")
 
-        for i in range(num_microbatches):
-            for j in range(i, num_microbatches):
+        num_microbatches = len(sorted_microbatch_infos)
+        precomputed_times = [
+            [float("inf")] * num_microbatches for _ in range(num_microbatches)
+        ]
+
+        for start_idx in range(num_microbatches):
+            for end_idx in range(start_idx, num_microbatches):
                 combined_mbs = 0
                 combined_max_length = 0
                 adapter_set = set()
 
                 if self.is_padding:
-                    for k in range(i, j + 1):
-                        mb = sorted_microbatch_infos[k]
-                        combined_mbs += mb.microbatch_size
-                        combined_max_length = max(combined_max_length, mb.max_length)
-                        for adapter_idx, _, _ in mb.samples:
+                    for idx in range(start_idx, end_idx + 1):
+                        microbatch_info = sorted_microbatch_infos[idx]
+                        combined_mbs += microbatch_info.microbatch_size
+                        combined_max_length = max(
+                            combined_max_length,
+                            microbatch_info.max_length,
+                        )
+                        for adapter_idx, _, _ in microbatch_info.samples:
                             adapter_set.add(adapter_idx)
                 else:
-                    # 如果不采用padding, combined_mbs设为1, combined_max_length设为所有样本实际长度之和
+                    # Ragged packing models all samples as one packed sequence.
                     combined_mbs = 1
                     total_length = 0
-                    for k in range(i, j + 1):
-                        mb = sorted_microbatch_infos[k]
-                        for adapter_idx, batch_idx, sample_idx in mb.samples:
+                    for idx in range(start_idx, end_idx + 1):
+                        microbatch_info = sorted_microbatch_infos[idx]
+                        for adapter_idx, batch_idx, sample_idx in microbatch_info.samples:
                             sample_length = aggregated_dataset[adapter_idx][batch_idx][sample_idx]
                             total_length += sample_length
                             adapter_set.add(adapter_idx)
                     combined_max_length = total_length
 
-
                 combined_adapter_count = len(adapter_set)
-                combined_rank = combined_adapter_count * 16  # 假设每个适配器 rank=16
+                combined_rank = combined_adapter_count * DEFAULT_ADAPTER_RANK
 
-                is_mem_valid = True
                 try:
                     mem_usage = self.mem_model.stage_memory_estimate(
                         bsz=combined_mbs,
@@ -512,95 +473,104 @@ class PipelineExecutionConstruction:
                         tasknum=combined_adapter_count,
                         pp_size=pp_size,
                     )
-                    if mem_usage > gpu_memory_limit:
-                        is_mem_valid = False
-                except Exception as e:
-                    print(f"显存估算失败，跳过组合 [{i},{j}]: {e}")
-                    is_mem_valid = False
+                except Exception as exc:
+                    logger.warning(
+                        "Memory estimation failed; skip packed group | range=[{}, {}] | error={}",
+                        start_idx,
+                        end_idx,
+                        exc,
+                    )
+                    continue
 
-                if is_mem_valid:
-                    try:
-                        exec_time = self.time_model.stage_execution_time_estimate(
+                if mem_usage > gpu_memory_limit:
+                    continue
+
+                try:
+                    precomputed_times[start_idx][end_idx] = (
+                        self.time_model.stage_execution_time_estimate(
                             micro_bsz=combined_mbs,
                             seqlen=combined_max_length,
                             rank=combined_rank,
                             tasknum=combined_adapter_count,
                             pp_size=pp_size,
                         )
-                        precomputed_times[i][j] = exec_time
-                    except Exception as e:
-                        print(f"时间估算失败，跳过组合 [{i},{j}]: {e}")
-                        precomputed_times[i][j] = float('inf')
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Time estimation failed; skip packed group | range=[{}, {}] | error={}",
+                        start_idx,
+                        end_idx,
+                        exc,
+                    )
 
         self.precomputed_times = precomputed_times
         return precomputed_times
 
     def _get_t_max_candidates(self, precomputed_times: List[List[float]]) -> List[float]:
-        """获取 t_max 候选值"""
-        t_max_candidates = set()
-        for i in range(len(precomputed_times)):
-            for j in range(i, len(precomputed_times)):
-                if precomputed_times[i][j] != float('inf'):
-                    t_max_candidates.add(precomputed_times[i][j])
-        return sorted(t_max_candidates)
+        """Return sorted feasible maximum-stage-time candidates."""
+        candidates = set()
+        for start_idx in range(len(precomputed_times)):
+            for end_idx in range(start_idx, len(precomputed_times)):
+                value = precomputed_times[start_idx][end_idx]
+                if value != float("inf"):
+                    candidates.add(value)
+        return sorted(candidates)
 
     def _generate_mlora_schedule(
         self,
         aggregated_dataset: List[List[List[int]]],
         adapter_to_microbatch_size: List[int],
         max_num_batches_to_schedule: int = 10000,
-        **kwargs,
-    ) -> List[Tuple[List[Tuple[int, int, int]], List[int]]]:
-        """生成 mLoRA 调度，支持每个适配器不同的 micro-batch size。
+        **_: Any,
+    ) -> Schedule:
+        """Generate an mLoRA schedule with per-adapter micro-batch sizes.
 
-        aggregated_dataset[i][j][k]:
-            adapter i, batch j, sample k 的 token 长度（这里只用来拿索引结构）
-        adapter_to_microbatch_size[i]:
-            第 i 个适配器的 micro-batch size
+        ``aggregated_dataset[i][j][k]`` is the token length of sample ``k`` in
+        batch ``j`` for adapter ``i``. This method only uses it to recover the
+        nested sample-index structure.
         """
         num_adapters = len(aggregated_dataset)
         if len(adapter_to_microbatch_size) != num_adapters:
             raise ValueError(
-                f"adapter_to_microbatch_size length {len(adapter_to_microbatch_size)} "
-                f"does not match num_adapters {num_adapters}"
+                "adapter_to_microbatch_size length mismatch: "
+                f"expected={num_adapters}, actual={len(adapter_to_microbatch_size)}"
             )
 
-        schedule: List[Tuple[List[Tuple[int, int, int]], List[int]]] = []
+        schedule: Schedule = []
         num_batches_in_each_adapter = [len(dataset) for dataset in aggregated_dataset]
         max_num_batches = max(num_batches_in_each_adapter) if num_adapters > 0 else 0
 
-        for j in range(max_num_batches):
-            for i in range(num_adapters):
-                # 当前适配器没有这么多 batch，跳过
-                if j >= num_batches_in_each_adapter[i]:
+        for batch_idx in range(max_num_batches):
+            for adapter_idx in range(num_adapters):
+                if batch_idx >= num_batches_in_each_adapter[adapter_idx]:
                     continue
 
-                batch = aggregated_dataset[i][j]
+                batch = aggregated_dataset[adapter_idx][batch_idx]
                 num_samples_in_batch = len(batch)
-                mbsz = adapter_to_microbatch_size[i]
-                if mbsz <= 0:
-                    raise ValueError(f"adapter {i} has non-positive micro-batch size {mbsz}")
+                microbatch_size = adapter_to_microbatch_size[adapter_idx]
+                if microbatch_size <= 0:
+                    raise ValueError(
+                        f"Adapter {adapter_idx} has a non-positive micro-batch size: "
+                        f"{microbatch_size}"
+                    )
 
-                # 按各自适配器的 mbsz 切 micro-batch
-                for microbatch_idx in range(
-                    (num_samples_in_batch + mbsz - 1) // mbsz
-                ):
-                    start_idx = microbatch_idx * mbsz
-                    end_idx = min(start_idx + mbsz, num_samples_in_batch)
-                    sample_indices = [(i, j, k) for k in range(start_idx, end_idx)]
+                num_microbatches = (num_samples_in_batch + microbatch_size - 1) // microbatch_size
+                for microbatch_idx in range(num_microbatches):
+                    start_sample_idx = microbatch_idx * microbatch_size
+                    end_sample_idx = min(start_sample_idx + microbatch_size, num_samples_in_batch)
+                    sample_indices = [
+                        (adapter_idx, batch_idx, sample_idx)
+                        for sample_idx in range(start_sample_idx, end_sample_idx)
+                    ]
                     schedule.append((sample_indices, []))
 
                     if len(schedule) >= max_num_batches_to_schedule:
                         return schedule
 
-                # 每个 batch 最后一个 micro-batch 做一次 optimizer step
-                schedule[-1][1].append(i)
+                schedule[-1][1].append(adapter_idx)
 
         return schedule
 
-    # ============================================================
-    # 对外调度接口：作为 PipelineExecutionConstruction 的实例方法
-    # ============================================================
     def generate_cappuccino_schedule(
         self,
         aggregated_dataset: List[List[List[int]]],
@@ -608,95 +578,72 @@ class PipelineExecutionConstruction:
         pp_size: int = 4,
         max_num_batches_to_schedule: int = 100000,
         is_return_cappuccino_without_reorder: bool = True,
-    ) -> List[Tuple[List[Tuple[int, int, int]], List[int]]]:
-        """
-        生成 Cappuccino 优化后的调度（类方法版）
-
-        返回：
-            优化后的微批次调度列表
-        """
-        # 1. 生成原始 mLoRA 调度
-        print("生成原始 mLoRA 调度...")
+    ) -> Union[Tuple[Schedule, Schedule, float], Tuple[Schedule, float]]:
+        """Generate the final Cappuccino-optimized schedule."""
         mlora_schedule = self._generate_mlora_schedule(
             aggregated_dataset=aggregated_dataset,
             adapter_to_microbatch_size=adapter_to_microbatch_size,
             max_num_batches_to_schedule=max_num_batches_to_schedule,
         )
 
-        # print(f"生成的 mLoRA 调度包含 {len(mlora_schedule)} 个微批次")
-        # for item in mlora_schedule:
-        #     print(item)
+        batch_to_microbatch_indices: Dict[int, List[int]] = {}
+        for microbatch_idx, (microbatch_samples, _) in enumerate(mlora_schedule):
+            for _, batch_idx, _ in microbatch_samples:
+                batch_to_microbatch_indices.setdefault(batch_idx, [])
+                if microbatch_idx not in batch_to_microbatch_indices[batch_idx]:
+                    batch_to_microbatch_indices[batch_idx].append(microbatch_idx)
 
-        # 2. 分析调度中的批次结构
-        print("分析批次结构...")
-        batches: Dict[int, List[int]] = {}  # {batch_idx: [microbatch_indices]}
+        for batch_idx in batch_to_microbatch_indices:
+            batch_to_microbatch_indices[batch_idx] = sorted(
+                set(batch_to_microbatch_indices[batch_idx])
+            )
 
-        for microbatch_idx, (microbatch_samples, optimizer_steps) in enumerate(mlora_schedule):
-            for adapter_idx, batch_idx, sample_idx in microbatch_samples:
-                if batch_idx not in batches:
-                    batches[batch_idx] = []
-                if microbatch_idx not in batches[batch_idx]:
-                    batches[batch_idx].append(microbatch_idx)
-
-        for batch_idx in batches:
-            batches[batch_idx] = sorted(list(set(batches[batch_idx])))
-
-        num_batches = len(batches)
-        print(f"发现 {num_batches} 个批次")
-
-        # 3. 为每个批次应用 Cappuccino 优化
-        optimized_schedule: List[Tuple[List[Tuple[int, int, int]], List[int]]] = []
-        optimized_schedule_without_reorder: List[Tuple[List[Tuple[int, int, int]], List[int]]] = []
-
+        optimized_schedule: Schedule = []
+        optimized_schedule_without_reorder: Schedule = []
         total_iteration_time = 0.0
-        for batch_idx in sorted(batches.keys()):
-            print(f"\n处理批次 {batch_idx}...")
 
-            batch_microbatch_indices = batches[batch_idx]
+        for batch_idx in sorted(batch_to_microbatch_indices):
+            batch_microbatch_indices = batch_to_microbatch_indices[batch_idx]
             batch_microbatches = [mlora_schedule[idx] for idx in batch_microbatch_indices]
 
-            print(f"批次 {batch_idx} 包含 {len(batch_microbatches)} 个微批次")
-
             if is_return_cappuccino_without_reorder:
-                optimized_batch_without_reorder, optimized_batch, estimation_time = self._cappuccino_pipeline_planner(
+                (
+                    optimized_batch_without_reorder,
+                    optimized_batch,
+                    estimation_time,
+                ) = self._cappuccino_pipeline_planner(
                     batch_microbatches=batch_microbatches,
                     aggregated_dataset=aggregated_dataset,
                     pp_size=pp_size,
-                    is_return_cappuccino_without_reorder=is_return_cappuccino_without_reorder,
+                    is_return_cappuccino_without_reorder=True,
                 )
                 optimized_schedule_without_reorder.extend(optimized_batch_without_reorder)
                 optimized_schedule.extend(optimized_batch)
-
-
             else:
                 optimized_batch, estimation_time = self._cappuccino_pipeline_planner(
                     batch_microbatches=batch_microbatches,
                     aggregated_dataset=aggregated_dataset,
                     pp_size=pp_size,
-                    is_return_cappuccino_without_reorder=is_return_cappuccino_without_reorder,
+                    is_return_cappuccino_without_reorder=False,
                 )
                 optimized_schedule.extend(optimized_batch)
-            
-
-            print(
-                f"批次 {batch_idx} 优化完成: "
-                f"{len(batch_microbatches)} -> {len(optimized_batch)} 个微批次"
-            )
 
             total_iteration_time += estimation_time if estimation_time is not None else 0.0
 
-        print(f"\n总体优化完成: {len(mlora_schedule)} -> {len(optimized_schedule)} 个微批次")
+        logger.info(
+            "Cappuccino schedule generated | batches={} | microbatches={} | "
+            "optimized_microbatches={} | estimated_total_iteration_time={:.6f}",
+            len(batch_to_microbatch_indices),
+            len(mlora_schedule),
+            len(optimized_schedule),
+            total_iteration_time,
+        )
 
         if is_return_cappuccino_without_reorder:
-            return optimized_schedule_without_reorder,optimized_schedule, total_iteration_time
-            
-        print
+            return optimized_schedule_without_reorder, optimized_schedule, total_iteration_time
         return optimized_schedule, total_iteration_time
 
 
-# =============================================
-# Click 测试入口
-# =============================================
 @click.command()
 @click.option("--dataset_path", default="datasets/dataset_distributions.json", type=str)
 @click.option("--num_adapters", default=4, type=int)
@@ -708,7 +655,7 @@ class PipelineExecutionConstruction:
     "--adapter_to_microbatch_size",
     default=None,
     type=str,
-    help="Optional per-adapter microbatch sizes, e.g. '1,2,4,1'",
+    help="Optional per-adapter micro-batch sizes, e.g., '1,2,4,1'.",
 )
 @click.option("--model_name", default="meta-llama/Llama-3.1-8B-Instruct", type=str)
 @click.option("--gpu_memory_limit", default=40.0, type=float)
@@ -726,22 +673,24 @@ def test_cappuccino_optimizer(
     gpu_memory_limit: float,
     output_name: str,
     max_num_batches: int,
-) -> None:    
+) -> None:
+    """CLI entry point for validating the Cappuccino pipeline planner."""
+    del gpu_memory_limit  # Kept for CLI compatibility; planner uses the default unless overridden.
+
     adapter_to_dataset_idx_list = list_of_ints(adapter_to_dataset_idx)
     adapter_to_global_batch_size_list = list_of_ints(adapter_to_global_batch_size)
 
     if len(adapter_to_dataset_idx_list) != num_adapters:
         raise ValueError(
             f"--adapter_to_dataset_idx length must be {num_adapters}, "
-            f"but got {len(adapter_to_dataset_idx_list)}"
+            f"but got {len(adapter_to_dataset_idx_list)}."
         )
     if len(adapter_to_global_batch_size_list) != num_adapters:
         raise ValueError(
             f"--adapter_to_global_batch_size length must be {num_adapters}, "
-            f"but got {len(adapter_to_global_batch_size_list)}"
+            f"but got {len(adapter_to_global_batch_size_list)}."
         )
 
-    # per-adapter microbatch_size
     if adapter_to_microbatch_size is None:
         adapter_to_microbatch_size_list = [microbatch_size] * num_adapters
     else:
@@ -749,25 +698,24 @@ def test_cappuccino_optimizer(
         if len(adapter_to_microbatch_size_list) != num_adapters:
             raise ValueError(
                 f"--adapter_to_microbatch_size length must be {num_adapters}, "
-                f"but got {len(adapter_to_microbatch_size_list)}"
+                f"but got {len(adapter_to_microbatch_size_list)}."
             )
 
-    if any(m <= 0 for m in adapter_to_microbatch_size_list):
-        raise ValueError("All microbatch sizes must be positive.")
+    if any(size <= 0 for size in adapter_to_microbatch_size_list):
+        raise ValueError("All micro-batch sizes must be positive.")
 
-    print("=" * 60)
-    print("Start Cappuccino Pipeline Planner Test")
-    print("=" * 60)
-    print(f"Per-adapter microbatch sizes: {adapter_to_microbatch_size_list}")
+    logger.info("=" * 72)
+    logger.info("Starting Cappuccino pipeline planner validation")
+    logger.info("=" * 72)
+    logger.info("Per-adapter micro-batch sizes: {}", adapter_to_microbatch_size_list)
 
-    # load dataset
-    path = Path(dataset_path)
-    if not path.exists():
-        raise FileNotFoundError(f"dataset_path not exists: {dataset_path}")
+    dataset_file = Path(dataset_path)
+    if not dataset_file.exists():
+        raise FileNotFoundError(f"Dataset file does not exist: {dataset_path}")
 
-    dataset_list = load_dataset_list(dataset_path=path)
-
+    dataset_list = load_dataset_list(dataset_path=dataset_file)
     aggregated_dataset: List[List[List[int]]] = []
+
     for adapter_idx in range(num_adapters):
         dataset_name, seed_idx, permutation_idx = dataset_list[
             adapter_to_dataset_idx_list[adapter_idx]
@@ -780,21 +728,20 @@ def test_cappuccino_optimizer(
         )
         mock_dataset = MockDataset.from_dataset_args(mock_data_args)
 
-        global_bsz = adapter_to_global_batch_size_list[adapter_idx]
-        curr_dataset: List[List[int]] = []
-        max_batches_here = min(len(mock_dataset) // global_bsz, max_num_batches)
+        global_batch_size = adapter_to_global_batch_size_list[adapter_idx]
+        adapter_dataset: List[List[int]] = []
+        max_batches_for_adapter = min(len(mock_dataset) // global_batch_size, max_num_batches)
 
-        for batch_idx in range(max_batches_here):
+        for batch_idx in range(max_batches_for_adapter):
             batch = mock_dataset[
-                batch_idx * global_bsz : (batch_idx + 1) * global_bsz
+                batch_idx * global_batch_size : (batch_idx + 1) * global_batch_size
             ]
-            curr_dataset.append(batch)
+            adapter_dataset.append(batch)
 
-        aggregated_dataset.append(curr_dataset)
+        aggregated_dataset.append(adapter_dataset)
 
     constructor = PipelineExecutionConstruction(model_name=model_name)
-
-    sched_wo, sched, total_time = constructor.generate_cappuccino_schedule(
+    _, schedule, total_time = constructor.generate_cappuccino_schedule(
         aggregated_dataset=aggregated_dataset,
         adapter_to_microbatch_size=adapter_to_microbatch_size_list,
         pp_size=num_pipeline_stages,
@@ -803,32 +750,40 @@ def test_cappuccino_optimizer(
 
     output_dir = Path("schedules")
     output_dir.mkdir(exist_ok=True)
-    new_schedule = MicroBatchInfo.shedules_to_adapter_group_step_infos(
-                schedules = sched, 
-                aggregated_dataset=aggregated_dataset, 
-                sequence_batch_layout="ragged")
 
+    new_schedule = MicroBatchInfo.shedules_to_adapter_group_step_infos(
+        schedules=schedule,
+        aggregated_dataset=aggregated_dataset,
+        sequence_batch_layout="ragged",
+    )
     save_schedule(
         schedule=new_schedule,
         path=str(output_dir),
         output_name=output_name,
     )
-    print("Done.")
+
+    logger.info(
+        "Cappuccino planner validation completed | output_dir={} | "
+        "estimated_total_iteration_time={:.6f}",
+        output_dir,
+        total_time,
+    )
 
 
 if __name__ == "__main__":
     test_cappuccino_optimizer()
 
-'''
-python -m Cappuccino.PipelineExecutionConstruction \
-  --dataset_path examples/dataset_distributions_16all_4096_seqlen_42_seed_1000_samples.json \
-  --num_adapters 4 \
-  --num_pipeline_stages 2 \
-  --adapter_to_dataset_idx "0,4,8,12" \
-  --adapter_to_global_batch_size "8,8,8,8" \
-  --adapter_to_microbatch_size "1,2,4,1" \
-  --model_name Llama-2-7b-hf \
-  --gpu_memory_limit 40 \
-  --output_name debug_cappuccino \
-  --max_num_batches 2
-'''
+"""
+Example:
+    python -m Cappuccino.PipelineExecutionConstruction \
+      --dataset_path examples/dataset_distributions_16all_4096_seqlen_42_seed_1000_samples.json \
+      --num_adapters 4 \
+      --num_pipeline_stages 2 \
+      --adapter_to_dataset_idx "0,4,8,12" \
+      --adapter_to_global_batch_size "8,8,8,8" \
+      --adapter_to_microbatch_size "1,2,4,1" \
+      --model_name Llama-2-7b-hf \
+      --gpu_memory_limit 40 \
+      --output_name debug_cappuccino \
+      --max_num_batches 2
+"""

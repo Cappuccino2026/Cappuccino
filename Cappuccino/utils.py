@@ -416,8 +416,6 @@ class MicroBatchInfo:
             List[AdapterGroupStepInfoFlexiblePadding]:
                 每个元素对应一个 AdapterGroupStep（即一个 global_batch_idx）
         """
-        print(f"Converting schedules to AdapterGroupStepInfo with data organization mode={sequence_batch_layout}...\n")
-        print(f'来自 other/lorafusion\n')
         # 按 global_batch_idx 聚合 micro-batch 列表
         # key: global_batch_idx
         # value: List[MicroBatchInfoFlexiblePadding]
